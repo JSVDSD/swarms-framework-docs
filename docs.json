@@ -288,6 +288,7 @@
             "group": "Multi-Agent Examples",
             "pages": [
               "examples/overviews/multi-agent-overview",
+              "examples/agents/csv-roster-preflight",
               "examples/sequential-workflow-example",
               "examples/sequential-workflow-streaming-example",
               "examples/concurrent-workflow-example",
