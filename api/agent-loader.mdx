@@ -31,7 +31,7 @@ loader = AgentLoader(concurrent=True)
 ```
 
 <ParamField path="concurrent" type="bool" default="True">
-  Default for concurrent loading when multiple files are passed. Individual `load_*` methods accept their own `concurrent` override.
+  Stored on the loader, but the current loading methods do not read this setting. For Markdown files, pass `concurrent=False` to `load_agents_from_markdown()` or `auto()` to disable parallel loading. `load_multiple_agents()` dispatches its input files sequentially.
 </ParamField>
 
 ## Methods
