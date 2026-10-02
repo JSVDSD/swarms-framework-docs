@@ -1,0 +1,213 @@
+---
+title: "Validate CSV agent rosters before loading"
+description: "Preflight CSV agent settings and verify a native serialization round trip without creating or running agents"
+icon: "table"
+---
+
+A CSV roster can hold agent names, prompts, model names, and runtime settings. Validate that data before constructing agents so an empty file, a mistyped setting, or an ambiguous boolean does not become a partially loaded team.
+
+This recipe uses the released `AgentValidator` and `CSVAgentLoader` to normalize configurations and write the native CSV format. It does not call `load_agents()` or `Agent.run()`. Passing these checks proves that the roster meets the example's data rules and survives serialization; it does not prove provider access, model availability, or agent performance.
+
+## Install and prepare a roster
+
+Use a dedicated environment and install the version used for this example:
+
+```bash
+python -m venv .venv
+# Activate the environment for your operating system.
+python -m pip install "swarms==15.0.3"
+```
+
+Save this as `agents.csv`. Quote any prompt containing commas, quotes, or line breaks using normal CSV rules.
+
+```csv
+agent_name,system_prompt,model_name,max_loops,autosave
+Researcher,"Summarize the supplied notes, preserving citations.",gpt-4o,1,false
+Editor,Review the supplied summary for unsupported claims.,gpt-4o,1,false
+```
+
+No provider key is needed for this preflight. Use your intended provider/model configuration when you subsequently construct or run agents.
+
+## Validate and write the native format
+
+Save the following as `validate_roster.py`. The wrapper checks column names against the library's configuration schema, then passes each record through the native validator. It requires nonblank names, prompts, and model names; unique names after trimming; explicit `true`/`false` booleans; and positive integers for loop, retry, and context settings. These are this recipe's stricter roster rules, not a claim that the framework enforces all of them itself.
+
+```python
+import csv
+import sys
+from pathlib import Path
+from typing import get_type_hints
+
+from swarms.structs.agent_loader import (
+    AgentConfigDict,
+    AgentValidationError,
+    AgentValidator,
+    CSVAgentLoader,
+)
+
+REQUIRED = {"agent_name", "system_prompt", "model_name"}
+BOOLEAN_FIELDS = {
+    "autosave", "dashboard", "verbose", "dynamic_temperature",
+    "return_step_meta", "streaming",
+}
+INTEGER_FIELDS = {"max_loops", "retry_attempts", "context_length"}
+
+
+def validate_roster(source: Path) -> list[dict]:
+    configs = []
+    names = set()
+    with source.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle, strict=True)
+        headers = reader.fieldnames or []
+        if len(headers) != len(set(headers)):
+            raise ValueError("Duplicate CSV column names")
+        if not REQUIRED.issubset(headers):
+            raise ValueError(f"Required columns: {sorted(REQUIRED)}")
+        unknown = set(headers) - set(get_type_hints(AgentConfigDict))
+        if unknown:
+            raise ValueError(f"Unknown columns: {sorted(unknown)}")
+
+        for record_number, row in enumerate(reader, start=1):
+            if None in row or any(value is None for value in row.values()):
+                raise ValueError(f"Record {record_number}: wrong column count")
+            if any(not row[field].strip() for field in REQUIRED):
+                raise ValueError(f"Record {record_number}: required value is blank")
+            row["agent_name"] = row["agent_name"].strip()
+            if row["agent_name"] in names:
+                raise ValueError(f"Record {record_number}: duplicate agent_name")
+            for field in BOOLEAN_FIELDS & row.keys():
+                if row[field].lower() not in {"true", "false"}:
+                    raise ValueError(f"Record {record_number}: {field} needs true/false")
+            for field in INTEGER_FIELDS & row.keys():
+                try:
+                    value = int(row[field])
+                except ValueError as error:
+                    raise ValueError(f"Record {record_number}: {field} needs an integer") from error
+                if value < 1:
+                    raise ValueError(f"Record {record_number}: {field} must be positive")
+            try:
+                config = AgentValidator.validate_config(row)
+            except AgentValidationError as error:
+                raise ValueError(f"Record {record_number}: {error.field} is invalid") from error
+            names.add(row["agent_name"])
+            configs.append(config)
+
+    if not configs:
+        raise ValueError("Roster has no agent records")
+    return configs
+
+
+def write_validated_roster(source: Path, destination: Path) -> int:
+    if source.resolve() == destination.resolve():
+        raise ValueError("Use a different output path")
+    if destination.exists():
+        raise ValueError("Output already exists; choose a new path")
+    configs = validate_roster(source)
+    CSVAgentLoader(destination).create_agent_file(configs)
+    if validate_roster(destination) != configs:
+        raise ValueError("Written roster did not preserve validated configurations")
+    return len(configs)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        raise SystemExit("Usage: python validate_roster.py INPUT.csv OUTPUT.csv")
+    try:
+        count = write_validated_roster(Path(sys.argv[1]), Path(sys.argv[2]))
+    except (ValueError, OSError, csv.Error):
+        raise SystemExit("Validation failed; review the CSV locally for missing, duplicate or invalid values.")
+    print(f"Validated {count} agent configurations; no agents were created or run.")
+```
+
+Run the script with a new output path in an existing directory:
+
+```bash
+python -X utf8 validate_roster.py agents.csv validated-agents.csv
+```
+
+`-X utf8` also gives the native CSV writer a UTF-8 default encoding. The input reader accepts a UTF-8 byte-order mark. On success, the command reports two validated configurations and creates `validated-agents.csv`. The output contains normalized defaults as well as the columns supplied in the input. Its raw CSV text can differ from the input while representing the same validated configurations.
+
+The script validates all records before writing and refuses to reuse the input path or overwrite an existing output. After writing, it reads the new roster and compares normalized configurations in order. A disk or round-trip failure can leave an output file: inspect that file locally and choose a new path before retrying.
+
+## Check the behavior locally
+
+Place this test file next to the script as `test_validate_roster.py`:
+
+```python
+import csv
+import tempfile
+import unittest
+from pathlib import Path
+
+from validate_roster import validate_roster, write_validated_roster
+
+
+class RosterTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.source = Path(self.tmp.name) / "input.csv"
+        self.output = Path(self.tmp.name) / "validated.csv"
+
+    def write_input(self, rows, headers=None):
+        headers = headers or ["agent_name", "system_prompt", "model_name", "autosave"]
+        with self.source.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(headers)
+            writer.writerows(rows)
+
+    def test_native_round_trip(self):
+        prompt = 'Summarize café notes, then quote "evidence".\nKeep citations.'
+        self.write_input([["Researcher", prompt, "gpt-4o", "false"]])
+        self.assertEqual(write_validated_roster(self.source, self.output), 1)
+        config = validate_roster(self.output)[0]
+        self.assertEqual(config["system_prompt"], prompt)
+        self.assertIs(config["autosave"], False)
+        self.assertEqual(config["retry_attempts"], 3)
+
+    def test_invalid_input_does_not_create_output(self):
+        for rows in [[], [["A", "Test", "gpt-4o", "yes"]],
+                     [["A", "Test", "gpt-4o", "false"], [" A ", "Test", "gpt-4o", "false"]]]:
+            with self.subTest(rows=rows):
+                self.write_input(rows)
+                with self.assertRaises(ValueError):
+                    write_validated_roster(self.source, self.output)
+                self.assertFalse(self.output.exists())
+
+    def test_misspelled_setting_is_rejected(self):
+        self.write_input([["A", "Test", "gpt-4o", "1"]],
+                         ["agent_name", "system_prompt", "model_name", "max_loop"])
+        with self.assertRaisesRegex(ValueError, "Unknown columns"):
+            validate_roster(self.source)
+
+    def test_existing_files_are_preserved(self):
+        self.write_input([["A", "Test", "gpt-4o", "false"]])
+        original = self.source.read_bytes()
+        self.output.write_bytes(b"keep this")
+        with self.assertRaises(ValueError):
+            write_validated_roster(self.source, self.output)
+        with self.assertRaises(ValueError):
+            write_validated_roster(self.source, self.source)
+        self.assertEqual(self.output.read_bytes(), b"keep this")
+        self.assertEqual(self.source.read_bytes(), original)
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+Run the four included tests:
+
+```bash
+python -X utf8 -m unittest -v test_validate_roster
+```
+
+They exercise the installed library's validation and writer, including quoted multiline Unicode prompts, native defaults, boolean conversion, invalid data, and protection of existing files. No agent constructors or model calls are substituted into these tests.
+
+## Troubleshoot and proceed
+
+If validation fails, inspect the roster locally. Check spelling, repeated column or agent names, missing cells, and boolean/integer formats. Do not paste complete prompt-bearing rows into public issue reports. The CLI intentionally prints a generic failure; calling `validate_roster()` locally provides the record number and field category without putting the complete row into its own error text.
+
+Omitted optional columns receive native defaults. An optional column present with an empty cell is still a supplied value, so it can fail these rules rather than receive a default. Remove an unused column or fill every cell explicitly.
+
+The native model-name check is based on LiteLLM's model list; it is not a remote provider check. To construct agents later, use `CSVAgentLoader("validated-agents.csv").load_agents()` as described in the [AgentLoader reference](/api/agent-loader). That is a separate step: the loader can skip invalid configurations and returns agents in completion order, so do not assume its output order matches the CSV. Verify the loaded names before handing the team to a workflow.
